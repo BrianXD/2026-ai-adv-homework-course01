@@ -68,6 +68,11 @@ function initializeDatabase() {
     );
   `);
 
+  // Migration: add ecpay_trade_no column for ECPay integration
+  try {
+    db.exec('ALTER TABLE orders ADD COLUMN ecpay_trade_no TEXT;');
+  } catch (e) { /* column already exists */ }
+
   // Seed data
   seedAdminUser();
   seedProducts();
