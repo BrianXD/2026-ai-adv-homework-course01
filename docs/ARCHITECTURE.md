@@ -13,11 +13,14 @@
 │   │   ├── adminMiddleware.js  # 檢查 req.user.role === 'admin'，否則 403
 │   │   ├── sessionMiddleware.js# 讀取 X-Session-Id header，掛到 req.sessionId
 │   │   └── errorHandler.js    # 全域錯誤 handler；500 屏蔽內部訊息；operational error 顯示 message
+│   ├── utils/
+│   │   └── ecpay.js            # 綠界工具：CheckMacValue 計算/驗證、buildPaymentParams、queryTradeInfo
 │   └── routes/
 │       ├── authRoutes.js       # POST /register、POST /login、GET /profile
 │       ├── productRoutes.js    # GET /products、GET /products/:id（公開）
 │       ├── cartRoutes.js       # 購物車 CRUD；dualAuth（JWT 優先，fallback session）
 │       ├── orderRoutes.js      # 使用者訂單；authMiddleware 強制登入
+│       ├── paymentRoutes.js    # 綠界金流：產生表單參數、OrderResultURL、ReturnURL
 │       ├── adminProductRoutes.js  # 管理員商品 CRUD；authMiddleware + adminMiddleware
 │       ├── adminOrderRoutes.js    # 管理員訂單查詢；authMiddleware + adminMiddleware
 │       └── pageRoutes.js       # EJS 頁面路由（前台 + 後台）
@@ -87,6 +90,7 @@ node server.js
         ├── app.use('/api/products', ...)
         ├── app.use('/api/cart', ...)           # dualAuth（內部自定義）
         ├── app.use('/api/orders', ...)         # authMiddleware（路由層 router.use）
+        ├── app.use('/api/payments', ...)       # 綠界金流（notify/result 不需認證；:orderId 需 JWT）
         ├── app.use('/', pageRoutes)
         ├── 404 handler（API → JSON；頁面 → EJS 404）
         └── errorHandler（全域錯誤）
@@ -110,7 +114,9 @@ node server.js
 | `/api/orders` | POST | `/` | JWT | 從購物車建立訂單 |
 | `/api/orders` | GET | `/` | JWT | 自己的訂單列表 |
 | `/api/orders` | GET | `/:id` | JWT | 訂單詳情 |
-| `/api/orders` | PATCH | `/:id/pay` | JWT | 模擬付款 |
+| `/api/payments` | POST | `/ecpay/:orderId` | JWT | 產生綠界付款表單參數 |
+| `/api/payments` | POST | `/ecpay/result` | 無 | 綠界 OrderResultURL 回調（瀏覽器） |
+| `/api/payments` | POST | `/ecpay/notify` | 無 | 綠界 ReturnURL 回調（server-to-server） |
 | `/api/admin/products` | GET | `/` | JWT + Admin | 後台商品列表 |
 | `/api/admin/products` | POST | `/` | JWT + Admin | 新增商品 |
 | `/api/admin/products` | PUT | `/:id` | JWT + Admin | 編輯商品 |
@@ -234,7 +240,10 @@ WAL mode 開啟（`journal_mode = WAL`）、外鍵強制開啟（`foreign_keys =
 | `recipient_address` | TEXT | NOT NULL | 收件地址 |
 | `total_amount` | INTEGER | NOT NULL | 訂單金額（新台幣） |
 | `status` | TEXT | NOT NULL DEFAULT 'pending' CHECK(IN 'pending','paid','failed') | 付款狀態 |
+| `ecpay_trade_no` | TEXT | - | 綠界 MerchantTradeNo（20 字元英數字；付款前寫入） |
 | `created_at` | TEXT | NOT NULL DEFAULT datetime('now') | 建立時間 |
+
+> `ecpay_trade_no` 由 `orderId` UUID 去除 `-` 後取前 20 字元生成，於呼叫 `POST /api/payments/ecpay/:orderId` 時寫入，供 OrderResultURL/ReturnURL callback 反查訂單使用。此欄位以 `ALTER TABLE ... ADD COLUMN` migration 方式新增（初次啟動時執行，已存在則跳過）。
 
 ### order_items 表
 
@@ -278,8 +287,13 @@ WAL mode 開啟（`journal_mode = WAL`）、外鍵強制開啟（`foreign_keys =
         ├── INSERT order_items（快照商品名稱和價格）
         ├── UPDATE products SET stock = stock - quantity（逐筆扣）
         └── DELETE cart_items WHERE user_id = ?（清空用戶購物車）
-用戶付款（PATCH /api/orders/:id/pay）
-  ├── action: 'success' → status = 'paid'
-  └── action: 'fail'    → status = 'failed'
-  （僅 pending 狀態可操作）
+用戶付款（POST /api/payments/ecpay/:orderId）  # JWT 認證
+  └── 產生含 CheckMacValue 的表單參數，寫入 ecpay_trade_no
+        └── 前端自動 POST 表單至 payment-stage.ecpay.com.tw
+              └── 用戶在綠界刷卡完成
+                    └── 綠界瀏覽器 redirect POST → /api/payments/ecpay/result
+                          ├── 後端主動呼叫 QueryTradeInfo/V5 確認付款狀態
+                          ├── TradeStatus=1 → status = 'paid'
+                          └── 其他 → status = 'failed'
+                                └── redirect /orders/:id?payment=success|failed
 ```

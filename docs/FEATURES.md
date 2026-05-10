@@ -8,13 +8,13 @@
 | 商品瀏覽（公開列表 + 詳情） | ✅ 完成 |
 | 購物車（訪客 + 登入雙模式） | ✅ 完成 |
 | 訂單建立（含庫存扣減 transaction） | ✅ 完成 |
-| 模擬付款（success/fail 切換） | ✅ 完成 |
+| 模擬付款（success/fail 切換） | 🗑️ 已移除（由 ECPay 金流取代） |
 | 後台商品管理（CRUD） | ✅ 完成 |
 | 後台訂單管理（查看 + 篩選狀態） | ✅ 完成 |
 | EJS 前台頁面（SSR） | ✅ 完成 |
 | EJS 後台頁面（SSR） | ✅ 完成 |
 | OpenAPI 文件生成 | ✅ 完成 |
-| 金流整合（ECPay） | ⏳ 待開發（環境變數已預留） |
+| 金流整合（ECPay AIO 信用卡） | ✅ 完成 |
 
 ---
 
@@ -143,14 +143,6 @@ JOIN products 取得商品即時資訊。回傳 `{ items, total }`，`total` 為
 
 查詢條件包含 `user_id`（防止用戶查看他人訂單）。回傳含 `items` 陣列。
 
-#### 模擬付款（PATCH /api/orders/:id/pay）
-
-必填：`action`（`success` 或 `fail`）。僅能操作 `status = pending` 的訂單。
-- `action: 'success'` → `status` 改為 `paid`
-- `action: 'fail'` → `status` 改為 `failed`
-
-付款後無法再次付款（非 pending 狀態 → 400 `INVALID_STATUS`）。
-
 ### 端點表
 
 | 方法 | 路徑 | 認證 | Request Body | 狀態碼 |
@@ -158,11 +150,91 @@ JOIN products 取得商品即時資訊。回傳 `{ items, total }`，`total` 為
 | POST | `/api/orders` | JWT | `{ recipientName, recipientEmail, recipientAddress }` | 201 / 400 / 401 |
 | GET | `/api/orders` | JWT | - | 200 / 401 |
 | GET | `/api/orders/:id` | JWT | - | 200 / 401 / 404 |
-| PATCH | `/api/orders/:id/pay` | JWT | `{ action: 'success'|'fail' }` | 200 / 400 / 401 / 404 |
 
 ---
 
-## 5. 後台商品管理（Admin）
+---
+
+## 5. 綠界金流（ECPay AIO）
+
+### 行為描述
+
+本專案僅運行於本地端，無法接收綠界伺服器主動推送的 ReturnURL 通知（server-to-server POST），因此以**本地端主動查詢** `QueryTradeInfo` API 取代，確認付款結果。
+
+#### 整體流程
+
+1. 用戶在訂單詳情頁（`/orders/:id`）點擊「前往綠界付款」
+2. 前端呼叫 `POST /api/payments/ecpay/:orderId`，後端產生含 CheckMacValue 的表單參數
+3. 前端以 JavaScript 動態建立 `<form method="POST">` 並立即送出，瀏覽器導向綠界測試環境
+4. 用戶在綠界完成刷卡（信用卡付款）
+5. 綠界透過瀏覽器 redirect（`OrderResultURL`）POST 回 `/api/payments/ecpay/result`
+6. 後端收到後，主動呼叫 `QueryTradeInfo/V5` 查詢真實付款狀態（防止竄改）
+7. 依查詢結果更新訂單 `status`，然後 redirect 至 `/orders/:id?payment=success|failed`
+
+#### 付款方式限制
+
+本實作僅支援**信用卡（ChoosePayment=Credit）**。其他方式（ATM、超商、TWQR 掃碼）的付款完成通知走 server-to-server ReturnURL，本地環境接收不到，不應選擇。
+
+#### 產生付款表單（POST /api/payments/ecpay/:orderId）
+
+需 JWT 認證，且訂單 `status` 必須為 `pending`。處理流程：
+1. 確認訂單屬於當前登入用戶
+2. 以 `orderId` 的 UUID 去除 `-` 後取前 20 字元作為 `MerchantTradeNo`（ECPay 限制最多 20 字元、英數字）
+3. 將 `MerchantTradeNo` 寫入訂單 `ecpay_trade_no` 欄位，供後續 callback 對應訂單
+4. 組合付款參數並以 SHA256 演算法計算 CheckMacValue
+5. 回傳 `{ actionUrl, params }` 供前端建立自動提交表單
+
+CheckMacValue 演算法遵循綠界規範：篩除 `CheckMacValue` 鍵 → 以 key 名稱 case-insensitive 排序 → 組合成 `HashKey=...&k=v&...&HashIV=...` → ECPay 特製 URL encode（PHP urlencode + lowercase + .NET 7 字元還原）→ SHA256 → 轉大寫。
+
+#### OrderResultURL 結果接收（POST /api/payments/ecpay/result）
+
+此為瀏覽器端 redirect，不需認證。綠界 POST body 含 `MerchantTradeNo`、`RtnCode` 等欄位。處理流程：
+1. 以 `MerchantTradeNo` 查詢訂單（`ecpay_trade_no` 欄位）
+2. 呼叫 `QueryTradeInfo/V5` 主動查詢確認，`TradeStatus=1` 為付款成功
+3. 若 QueryTradeInfo 呼叫失敗，fallback 使用綠界 POST 的 `RtnCode`（`1` = 成功）
+4. 更新訂單 `status`（`paid` 或 `failed`），redirect 至訂單詳情頁並帶 `?payment=success|failed`
+
+#### ReturnURL（POST /api/payments/ecpay/notify）
+
+本地環境下，綠界無法連線至 `localhost`，此 endpoint 實際上不會被呼叫到。但仍實作為備用（未來部署至公開伺服器時自動生效）：驗證 CheckMacValue → 查訂單 → 更新 status → 回傳純文字 `1|OK`。
+
+#### 付款狀態 payload
+
+| paymentResult 參數值 | 訂單 status | 顯示訊息 |
+|-----------------------|-------------|----------|
+| `success` | `paid` | 付款成功！感謝您的購買。 |
+| `failed` | `failed` | 付款失敗，請重試。 |
+| `cancel` | 不變（仍為 `pending`） | 付款已取消。 |
+
+### 端點表
+
+| 方法 | 路徑 | 認證 | 說明 | 狀態碼 |
+|------|------|------|------|--------|
+| POST | `/api/payments/ecpay/:orderId` | JWT | 產生付款表單參數 | 200 / 400 / 401 / 404 |
+| POST | `/api/payments/ecpay/result` | 無 | 綠界 OrderResultURL 回調（瀏覽器） | 302 |
+| POST | `/api/payments/ecpay/notify` | 無 | 綠界 ReturnURL 回調（server-to-server，本地備用） | 200（純文字） |
+
+### 相關環境變數
+
+| 變數名稱 | 說明 | 測試值 |
+|----------|------|--------|
+| `ECPAY_MERCHANT_ID` | 特店編號 | `3002607` |
+| `ECPAY_HASH_KEY` | CheckMacValue Hash Key | `pwFHCqoQZGmho4w6` |
+| `ECPAY_HASH_IV` | CheckMacValue Hash IV | `EkRm7iFT261dpevs` |
+| `ECPAY_ENV` | 環境切換（`staging` / `production`） | `staging` |
+| `BASE_URL` | 本機伺服器 URL（用於拼接 callback URL） | `http://localhost:3001` |
+
+### 測試信用卡（staging 環境）
+
+| 欄位 | 值 |
+|------|-----|
+| 卡號 | `4311-9522-2222-2222` |
+| 有效期 | 任意未來月/年 |
+| CVV | 任意三位數 |
+
+---
+
+## 7. 後台商品管理（Admin）
 
 ### 行為描述
 
@@ -200,7 +272,7 @@ JOIN products 取得商品即時資訊。回傳 `{ items, total }`，`total` 為
 
 ---
 
-## 6. 後台訂單管理（Admin）
+## 8. 後台訂單管理（Admin）
 
 ### 行為描述
 
